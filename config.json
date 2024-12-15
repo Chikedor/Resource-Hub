@@ -1,0 +1,18 @@
+{
+    "update_interval": 0.9999999999999994,
+    "max_data_points": 60,
+    "show_notifications": true,
+    "notification_grace_period": 300,
+    "thresholds": {
+        "cpu": 80,
+        "ram": 80,
+        "disk": 80,
+        "gpu": 80
+    },
+    "graph": {
+        "show": true,
+        "line_width": 2,
+        "grid_alpha": 0.2
+    },
+    "theme": "dark"
+}
