@@ -11,10 +11,16 @@ import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
-import GPUtil
 import glob
 import json
-from logger_config import get_logger
+from logger_config import (
+    get_logger,
+    log_metrics,
+    log_performance,
+    log_error,
+    log_warning,
+    log_debug
+)
 import cProfile
 import io
 import pstats
@@ -43,6 +49,13 @@ THEME = {
         'gpu': '#f44336'
     }
 }
+
+try:
+    import GPUtil
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
+    print("GPUtil no está disponible. La monitorización de GPU estará desactivada.")
 
 class UIFactory:
     """Clase utilitaria para crear widgets de UI consistentes"""
@@ -77,7 +90,7 @@ class UIFactory:
         **kwargs
     ) -> ctk.CTkLabel:
         """Crea una etiqueta con estilo consistente"""
-        font = ('Segoe UI', font_size, 'bold' if bold else '')
+        font = ('Segoe UI', font_size, 'bold') if bold else ('Segoe UI', font_size)
         return ctk.CTkLabel(
             master,
             text=text,
@@ -93,9 +106,10 @@ class UIFactory:
         **kwargs
     ) -> ctk.CTkFrame:
         """Crea un frame con estilo consistente"""
+        if 'fg_color' not in kwargs:
+            kwargs['fg_color'] = 'transparent' if transparent else THEME['card_bg']
         return ctk.CTkFrame(
             master,
-            fg_color='transparent' if transparent else THEME['card_bg'],
             **kwargs
         )
 
@@ -696,16 +710,27 @@ class MonitorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Inicializar logger y monitor de rendimiento
+        # Inicializar logger
         self.logger = get_logger()
-        self.performance_monitor = PerformanceMonitor(self.logger)
-        self.logger.info("Iniciando System Monitor")
 
         # Cargar configuración
         self.settings = Settings()
         self.colors = THEME
 
-        # Configuración de la ventana
+        # Loguear información inicial
+        log_metrics({
+            'type': 'startup',
+            'system': {
+                'os': f"{platform.system()} {platform.release()}",
+                'python': sys.version,
+                'config': self.settings.settings
+            }
+        })
+
+        # Inicializar monitor de rendimiento
+        self.performance_monitor = PerformanceMonitor(self.logger)
+
+        # Configuración de la ventana y componentes
         self._setup_window()
         self._setup_containers()
         self._initialize_metrics()
@@ -717,12 +742,16 @@ class MonitorApp(ctk.CTk):
         # Iniciar monitoreo
         self._start_monitoring()
 
-    def _setup_window(self) -> None:
+    def _setup_window(self):
         """Configura la ventana principal"""
         self.title("System Monitor")
         self.geometry("1200x800")
+        log_debug("Ventana principal configurada")
+
         self.configure(fg_color=self.colors['background'])
         ctk.set_appearance_mode("dark" if self.settings.settings['theme'] == 'dark' else "light")
+        log_debug(f"Tema configurado: {self.settings.settings['theme']}")
+
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.bind("<Configure>", self.on_resize)
 
@@ -794,41 +823,52 @@ class MonitorApp(ctk.CTk):
         """Crea la barra de menú"""
         toolbar = UIFactory.create_frame(
             self,
-            fg_color=self.colors['card_bg']
+            height=40
         )
-        toolbar.configure(height=40)
         toolbar.pack(fill='x', padx=0, pady=0)
 
         # Botones de navegación
         self.monitor_btn = UIFactory.create_button(
             toolbar,
-            text="📊 Monitor",
+            text="Monitor",
             command=self.show_monitor_view,
-            fg_color="transparent",
-            hover_color=UIFactory.apply_brightness(self.colors['card_bg'], 1.1)
+            width=100
         )
-        self.monitor_btn.pack(side='right', padx=10, pady=5)
+        self.monitor_btn.pack(side='left', padx=5, pady=5)
 
         self.settings_btn = UIFactory.create_button(
             toolbar,
-            text="⚙️ Settings",
+            text="Settings",
             command=self.show_settings,
-            fg_color="transparent",
-            hover_color=UIFactory.apply_brightness(self.colors['card_bg'], 1.1)
+            width=100
         )
-        self.settings_btn.pack(side='right', padx=10, pady=5)
+        self.settings_btn.pack(side='left', padx=5, pady=5)
 
-    def create_widgets(self) -> None:
-        """Crea los widgets de monitoreo"""
-        try:
+    def show_monitor_view(self):
+        """Muestra la vista del monitor"""
+        if self.current_view == "monitor":
+            return
+
+        # Limpiar vista actual
+        if self.settings_view:
+            self.settings_view.pack_forget()
+
+        # Crear vista de monitor si no existe
+        if not self.monitor_view:
+            self.monitor_view = UIFactory.create_frame(
+                self.view_container,
+                transparent=True
+            )
+            self.monitor_view.pack(fill='both', expand=True)
+
             # Grid de métricas
             metrics_grid = UIFactory.create_frame(
                 self.monitor_view,
                 transparent=True
             )
-            metrics_grid.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+            metrics_grid.pack(fill='x', padx=10, pady=10)
 
-            # Hacer el grid responsivo
+            # Configurar grid
             for i in range(3):
                 metrics_grid.grid_columnconfigure(i, weight=1, uniform="metric")
             metrics_grid.grid_rowconfigure(0, weight=1)
@@ -845,7 +885,7 @@ class MonitorApp(ctk.CTk):
             self.ram_card = MetricCard(
                 metrics_grid,
                 "RAM Usage",
-                tooltip_text="Uso de memoria RAM\nMuestra el consumo actual de memoria",
+                tooltip_text="Porcentaje de uso de memoria RAM\nMuestra el consumo actual de memoria",
                 metric_color=self.colors['metrics']['ram']
             )
             self.ram_card.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
@@ -853,46 +893,22 @@ class MonitorApp(ctk.CTk):
             self.gpu_card = MetricCard(
                 metrics_grid,
                 "GPU Usage",
-                tooltip_text="Uso de la tarjeta gráfica\nMuestra la carga actual de la GPU",
+                tooltip_text="Porcentaje de uso de la GPU\nMuestra la carga actual de la tarjeta gráfica",
                 metric_color=self.colors['metrics']['gpu']
             )
             self.gpu_card.grid(row=0, column=2, padx=5, pady=5, sticky="nsew")
 
-            self.logger.debug("Widgets creados correctamente")
-        except Exception as e:
-            self.logger.error(f"Error al crear widgets: {str(e)}", exc_info=True)
-            raise
+            # Configurar gráfico
+            if self.settings.settings['graph']['show']:
+                self.setup_graph()
 
-    def show_monitor_view(self):
-        try:
-            self.logger.debug("Cambiando a vista de monitoreo")
+        self.current_view = "monitor"
 
-            # Ocultar vista actual si existe
-            if self.current_view:
-                self.current_view.grid_remove()
+        # Actualizar estado de botones
+        self.monitor_btn.configure(fg_color=self.colors['primary'])
+        self.settings_btn.configure(fg_color="transparent")
 
-            # Crear vista de monitoreo si no existe
-            if not self.monitor_view:
-                self.monitor_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
-                self.monitor_view.grid(row=0, column=0, sticky="nsew")
-                self.monitor_view.grid_columnconfigure(0, weight=1)
-                self.monitor_view.grid_rowconfigure(1, weight=1)
-
-                # Crear widgets de monitoreo
-                self.create_widgets()
-                if self.settings.settings['graph']['show']:
-                    self.setup_graph()
-
-            # Mostrar vista de monitoreo
-            self.monitor_view.grid()
-            self.current_view = self.monitor_view
-
-            # Actualizar estado de botones
-            self.monitor_btn.configure(fg_color=self.colors['primary'])
-            self.settings_btn.configure(fg_color="transparent")
-
-        except Exception as e:
-            self.logger.error(f"Error al mostrar vista de monitoreo: {str(e)}")
+        self.logger.debug("Vista de monitor mostrada correctamente")
 
     def show_settings(self):
         try:
@@ -1028,7 +1044,7 @@ class MonitorApp(ctk.CTk):
         else:
             plt.style.use('default')
 
-        # Crear figura y ejes con un tamaño inicial más pequeño y márgenes ajustados
+        # Crear figura y ejes con un tamaño inicial ms pequeño y márgenes ajustados
         self.fig = plt.figure(figsize=(8, 3), facecolor=self.colors['card_bg'])
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.2)
@@ -1036,39 +1052,54 @@ class MonitorApp(ctk.CTk):
         self.ax.set_facecolor(self.colors['card_bg'])
 
         # Configurar estilo del gráfico
-        self.ax.grid(True, color=self.colors['text'], alpha=self.settings.settings['graph']['grid_alpha'])
+        self.ax.grid(True, color=self.colors['text'], alpha=self.settings.settings['graph']['grid_alpha'], linestyle='--')
         self.ax.set_ylim(0, 100)
 
-        # Configurar colores y etiquetas
+        # Configurar colores y etiquetas con líneas más visibles
         self.cpu_line, = self.ax.plot([], [],
             label='CPU',
             color=self.colors['metrics']['cpu'],
-            linewidth=self.settings.settings['graph']['line_width']
+            linewidth=self.settings.settings['graph']['line_width'],
+            marker='.',
+            markersize=4,
+            linestyle='-',
+            solid_capstyle='round'
         )
         self.ram_line, = self.ax.plot([], [],
             label='RAM',
             color=self.colors['metrics']['ram'],
-            linewidth=self.settings.settings['graph']['line_width']
+            linewidth=self.settings.settings['graph']['line_width'],
+            marker='.',
+            markersize=4,
+            linestyle='-',
+            solid_capstyle='round'
         )
         self.gpu_line, = self.ax.plot([], [],
             label='GPU',
             color=self.colors['metrics']['gpu'],
-            linewidth=self.settings.settings['graph']['line_width']
+            linewidth=self.settings.settings['graph']['line_width'],
+            marker='.',
+            markersize=4,
+            linestyle='-',
+            solid_capstyle='round'
         )
 
-        # Configurar leyenda
+        # Configurar leyenda con mejor visibilidad
         self.ax.legend(
             facecolor=self.colors['card_bg'],
-            edgecolor=self.colors['card_bg'],
+            edgecolor=self.colors['text'],
             labelcolor=self.colors['text'],
             loc='upper left',
-            bbox_to_anchor=(0.02, 0.98)
+            bbox_to_anchor=(0.02, 0.98),
+            framealpha=0.8,
+            shadow=True
         )
 
-        # Configurar etiquetas de ejes
-        self.ax.tick_params(colors=self.colors['text'])
+        # Configurar etiquetas de ejes con mejor visibilidad
+        self.ax.tick_params(colors=self.colors['text'], length=6, width=1, direction='out')
         for spine in self.ax.spines.values():
             spine.set_color(self.colors['text'])
+            spine.set_linewidth(1)
 
         # Configurar el formateador de fechas para el eje X
         locator = mdates.AutoDateLocator(minticks=3, maxticks=7)
@@ -1084,15 +1115,82 @@ class MonitorApp(ctk.CTk):
             self.graph_frame.destroy()
 
         self.graph_frame = ctk.CTkFrame(self.monitor_view, fg_color=self.colors['card_bg'], corner_radius=10)
-        self.graph_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self.graph_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Crear canvas
+        # Crear canvas con mejor resolución
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
+        self.fig.set_dpi(100)  # Aumentar DPI para mejor calidad
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=10, pady=10)
 
         # Configurar el manejo de eventos de redimensionamiento
         self._resize_timer = None
+
+    def update_graph(self):
+        """Actualización optimizada del gráfico con manejo de errores"""
+        try:
+            if not hasattr(self, 'canvas') or not self.settings.settings['graph']['show']:
+                return
+
+            timestamps = self.cpu_metrics.get_timestamps()
+            if len(timestamps) < 2:
+                return
+
+            # Convertir timestamps a datetime de manera segura
+            try:
+                timestamps = [datetime.fromtimestamp(ts) for ts in timestamps]
+            except (ValueError, TypeError) as e:
+                self.logger.error(f"Error al convertir timestamps: {str(e)}")
+                return
+
+            cpu_data = self.cpu_metrics.get_values()
+            ram_data = self.ram_metrics.get_values()
+            gpu_data = self.gpu_metrics.get_values()
+
+            # Validar datos antes de actualizar
+            if len(timestamps) != len(cpu_data) or len(timestamps) != len(ram_data) or len(timestamps) != len(gpu_data):
+                self.logger.error("Inconsistencia en la longitud de los datos")
+                return
+
+            # Asegurarse de que los datos no estén vacíos y sean válidos
+            if not any(len(data) > 0 for data in [cpu_data, ram_data, gpu_data]):
+                return
+
+            # Validar que los datos estén en el rango correcto
+            cpu_data = np.clip(cpu_data, 0, 100)
+            ram_data = np.clip(ram_data, 0, 100)
+            gpu_data = np.clip(gpu_data, 0, 100)
+
+            # Actualizar datos de manera segura
+            try:
+                self.cpu_line.set_data(timestamps, cpu_data)
+                self.ram_line.set_data(timestamps, ram_data)
+                self.gpu_line.set_data(timestamps, gpu_data)
+
+                # Ajustar límites del eje X con margen
+                if timestamps:
+                    x_min, x_max = timestamps[0], timestamps[-1]
+                    margin = timedelta(seconds=5)
+                    self.ax.set_xlim(x_min - margin, x_max + margin)
+
+                # Ajustar límites del eje Y si es necesario
+                y_max = max(max(cpu_data), max(ram_data), max(gpu_data))
+                if y_max > 100:
+                    self.ax.set_ylim(0, min(y_max * 1.1, 100))
+                else:
+                    self.ax.set_ylim(0, 100)
+
+                # Actualizar vista solo si es necesario
+                if not hasattr(self, '_last_draw') or time.time() - self._last_draw > 0.5:
+                    self.canvas.draw_idle()
+                    self._last_draw = time.time()
+                    self.logger.debug("Gráfico actualizado correctamente")
+
+            except Exception as e:
+                self.logger.error(f"Error al actualizar datos del gráfico: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Error en update_graph: {str(e)}", exc_info=True)
 
     def on_resize(self, event):
         # Solo procesar eventos de la ventana principal
@@ -1122,40 +1220,6 @@ class MonitorApp(ctk.CTk):
         finally:
             self._resize_timer = None
 
-    def update_graph(self):
-        """Actualización optimizada del gráfico"""
-        try:
-            if not hasattr(self, 'canvas'):
-                return
-
-            timestamps = [datetime.fromtimestamp(ts) for ts in self.cpu_metrics.get_timestamps()]
-
-            if len(timestamps) < 2:
-                return
-
-            cpu_data = self.cpu_metrics.get_values()
-            ram_data = self.ram_metrics.get_values()
-            gpu_data = self.gpu_metrics.get_values()
-
-            # Actualizar datos
-            self.cpu_line.set_data(timestamps, cpu_data)
-            self.ram_line.set_data(timestamps, ram_data)
-            self.gpu_line.set_data(timestamps, gpu_data)
-
-            # Ajustar límites del eje X
-            if timestamps:
-                x_min, x_max = timestamps[0], timestamps[-1]
-                margin = timedelta(seconds=5)  # Margen fijo de 5 segundos
-                self.ax.set_xlim(x_min - margin, x_max + margin)
-
-            # Actualizar vista solo si es necesario
-            if not hasattr(self, '_last_draw') or time.time() - self._last_draw > 0.5:
-                self.canvas.draw_idle()
-                self._last_draw = time.time()
-
-        except Exception as e:
-            self.logger.error(f"Error en update_graph: {str(e)}", exc_info=True)
-
     def on_closing(self):
         """Limpieza y cierre optimizado"""
         self.logger.info("Cerrando aplicación")
@@ -1164,20 +1228,35 @@ class MonitorApp(ctk.CTk):
         self.quit()
 
     def apply_settings(self):
-        # Aplicar nuevo tema
-        self.colors = THEME
-        self.configure(fg_color=self.colors['background'])
-        ctk.set_appearance_mode("dark" if self.settings.settings['theme'] == 'dark' else "light")
+        """Aplica la configuración de manera segura"""
+        try:
+            # Aplicar nuevo tema
+            self.colors = THEME
+            self.configure(fg_color=self.colors['background'])
 
-        # Actualizar widgets
-        self._update_widget_colors()
+            # Actualizar modo de apariencia
+            try:
+                ctk.set_appearance_mode("dark" if self.settings.settings.get('theme') == 'dark' else "light")
+            except Exception as e:
+                self.logger.error(f"Error al cambiar el tema: {str(e)}")
 
-        # Actualizar gráfico si es necesario
-        if hasattr(self, 'graph_frame'):
-            if self.settings.settings['graph']['show']:
-                self.setup_graph()
-            else:
-                self.graph_frame.grid_remove()
+            # Actualizar widgets si existen
+            if hasattr(self, '_update_widget_colors'):
+                self._update_widget_colors()
+
+            # Actualizar gráfico si es necesario
+            if hasattr(self, 'graph_frame'):
+                try:
+                    if self.settings.settings.get('graph', {}).get('show', True):
+                        self.setup_graph()
+                    else:
+                        self.graph_frame.grid_remove()
+                except Exception as e:
+                    self.logger.error(f"Error al actualizar el gráfico: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Error al aplicar configuración: {str(e)}", exc_info=True)
+            messagebox.showerror("Error", "No se pudo aplicar la configuración. Se utilizará la configuración por defecto.")
 
     def _update_widget_colors(self):
         # Actualizar colores de las tarjetas
@@ -1195,15 +1274,18 @@ class MonitorApp(ctk.CTk):
             card.value_label.configure(text_color=self.colors['text'])
 
     def get_gpu_usage(self):
+        """Obtiene el uso de GPU de manera segura"""
+        if not GPU_AVAILABLE:
+            return 0, None
+
         try:
             gpus = GPUtil.getGPUs()
             if gpus and len(gpus) > 0:
                 gpu = gpus[0]
                 return gpu.load * 100 if gpu.load is not None else 0, getattr(gpu, 'temperature', None)
-            return 0, None
         except Exception as e:
             self.logger.error(f"Error al obtener información de GPU: {str(e)}", exc_info=True)
-            return 0, None
+        return 0, None
 
     def get_disk_usage(self):
         try:
@@ -1271,70 +1353,91 @@ class MonitorApp(ctk.CTk):
         max_errors = 3
         min_update_interval = 0.1
         max_update_interval = 2.0
+        last_log_time = 0
+        log_interval = 60  # Loguear métricas cada 60 segundos
 
+        self.logger.info("Iniciando monitoreo de recursos")
+
+        log_debug("Iniciando bucle de monitoreo")
         while self.running:
             try:
                 current_time = time.time()
                 elapsed = current_time - self.last_update_time
+
+                # Logging periódico
+                if current_time - last_log_time >= log_interval:
+                    log_debug(f"Intervalo actual de actualización: {self.update_interval:.2f}s")
+                    metrics = self._get_system_metrics()
+                    if metrics:
+                        cpu_percent, ram_percent, gpu_percent = metrics
+                        log_metrics({
+                            'timestamp': datetime.now().isoformat(),
+                            'metrics': {
+                                'cpu': {
+                                    'percent': cpu_percent,
+                                    'frequency': self._get_cpu_frequency()
+                                },
+                                'ram': {
+                                    'percent': ram_percent,
+                                    'used_gb': psutil.virtual_memory().used / (1024**3),
+                                    'total_gb': psutil.virtual_memory().total / (1024**3)
+                                },
+                                'gpu': {
+                                    'percent': gpu_percent,
+                                    'info': self._get_gpu_info()
+                                }
+                            }
+                        })
+                        log_debug(f"Métricas actualizadas - CPU: {cpu_percent:.1f}%, RAM: {ram_percent:.1f}%, GPU: {gpu_percent:.1f}%")
+
+                        # Logging de rendimiento
+                        log_performance({
+                            'update_interval': self.update_interval,
+                            'elapsed_time': elapsed,
+                            'error_count': error_count,
+                            'metrics_count': len(self.cpu_metrics.get_values())
+                        })
+                    else:
+                        log_warning("No se pudieron obtener métricas del sistema")
+
+                    last_log_time = current_time
 
                 # Control de frecuencia de actualización
                 if elapsed < self.update_interval * 0.9:
                     time.sleep(max(min_update_interval, self.update_interval - elapsed))
                     continue
 
-                # Perfilado periódico
-                if self.skip_updates % 100 == 0:
-                    self.performance_monitor.start_profiling()
+                # Actualización de métricas
+                metrics = self._get_system_metrics()
+                if metrics:
+                    cpu_percent, ram_percent, gpu_percent = metrics
+                    timestamp = current_time
 
-                # Actualización de métricas con manejo de errores
-                try:
-                    if current_time - last_metrics_update >= metrics_update_interval:
-                        # Obtener métricas de manera eficiente
-                        metrics = self._get_system_metrics()
-                        if metrics:
-                            cpu_percent, ram_percent, gpu_percent = metrics
-                            timestamp = current_time
+                    # Almacenar métricas de manera segura
+                    try:
+                        with self._get_metrics_lock():
+                            self.cpu_metrics.add_metric(cpu_percent, timestamp)
+                            self.ram_metrics.add_metric(ram_percent, timestamp)
+                            self.gpu_metrics.add_metric(gpu_percent, timestamp)
+                            log_debug(f"Métricas almacenadas - CPU: {cpu_percent:.1f}%, RAM: {ram_percent:.1f}%, GPU: {gpu_percent:.1f}%")
 
-                            # Almacenar métricas de manera atómica
-                            with self._get_metrics_lock():
-                                self.cpu_metrics.add_metric(cpu_percent, timestamp)
-                                self.ram_metrics.add_metric(ram_percent, timestamp)
-                                self.gpu_metrics.add_metric(gpu_percent, timestamp)
+                        # Actualizar UI y gráfico
+                        self.after(0, lambda: self.update_ui(cpu_percent, ram_percent, gpu_percent))
+                        self.after(0, self.update_graph)
 
-                            last_metrics_update = current_time
-                            error_count = 0  # Resetear contador de errores
+                    except Exception as e:
+                        self.logger.error(f"Error al almacenar métricas: {str(e)}")
+                        error_count += 1
 
-                            # Actualizar UI con las nuevas métricas
-                            self.after(0, lambda: self.update_ui(cpu_percent, ram_percent, gpu_percent))
-
-                except Exception as e:
-                    error_count += 1
-                    self.logger.error(f"Error al actualizar métricas: {str(e)}", exc_info=True)
-                    if error_count >= max_errors:
-                        self.logger.error("Demasiados errores consecutivos, ajustando intervalo")
-                        self.update_interval = min(max_update_interval, self.update_interval * 1.5)
-                        error_count = 0
-
-                # Control de rendimiento adaptativo
-                if elapsed > self.update_interval * 1.1:
-                    self.skip_updates += 1
-                    if self.skip_updates > 5:
-                        new_interval = min(max_update_interval, self.update_interval * 1.2)
-                        self.logger.warning(f"Ajustando intervalo de actualización a {new_interval:.1f}s")
-                        self.update_interval = new_interval
-                        self.skip_updates = 0
-                elif elapsed < self.update_interval * 0.5 and self.update_interval > min_update_interval:
-                    # Reducir el intervalo si el rendimiento es bueno
-                    self.update_interval = max(min_update_interval, self.update_interval * 0.9)
-
-                self.last_update_time = current_time
-
-                # Finalizar perfilado
-                if self.skip_updates % 100 == 0:
-                    self.performance_monitor.stop_profiling()
+                    self.last_update_time = current_time
 
             except Exception as e:
+                error_count += 1
                 self.logger.error(f"Error en update_stats: {str(e)}", exc_info=True)
+                if error_count >= max_errors:
+                    self.logger.error("Demasiados errores consecutivos, ajustando intervalo")
+                    self.update_interval = min(max_update_interval, self.update_interval * 1.5)
+                    error_count = 0
                 time.sleep(self.update_interval)
 
     def _get_metrics_lock(self) -> Lock:
@@ -1344,62 +1447,114 @@ class MonitorApp(ctk.CTk):
         return self._metrics_lock
 
     def _get_system_metrics(self) -> Optional[tuple[float, float, float]]:
-        """Obtiene las métricas del sistema de manera eficiente"""
+        """Obtiene las métricas del sistema de manera segura"""
         try:
-            # Obtener CPU sin bloquear
-            cpu_percent = psutil.cpu_percent(interval=None)
+            # Obtener CPU con timeout
+            cpu_percent = psutil.cpu_percent(interval=0.1)
 
             # Obtener RAM
             ram = psutil.virtual_memory()
             ram_percent = ram.percent
 
-            # Obtener GPU
+            # Obtener GPU de manera segura
             gpu_percent, _ = self.get_gpu_usage()
 
+            # Validar valores
+            cpu_percent = max(0, min(100, float(cpu_percent)))
+            ram_percent = max(0, min(100, float(ram_percent)))
+            gpu_percent = max(0, min(100, float(gpu_percent)))
+
             return cpu_percent, ram_percent, gpu_percent
+
         except Exception as e:
             self.logger.error(f"Error al obtener métricas del sistema: {str(e)}", exc_info=True)
             return None
+
+    def _log_system_details(self):
+        """Registra detalles adicionales del sistema"""
+        try:
+            # CPU
+            cpu_freq = psutil.cpu_freq()
+            if cpu_freq:
+                self.logger.debug(f"CPU Frecuencia - Current: {cpu_freq.current:.1f}MHz, "
+                                f"Min: {cpu_freq.min:.1f}MHz, Max: {cpu_freq.max:.1f}MHz")
+
+            # Memoria
+            mem = psutil.virtual_memory()
+            self.logger.debug(
+                f"Memoria - Total: {mem.total/1024**3:.1f}GB, "
+                f"Disponible: {mem.available/1024**3:.1f}GB, "
+                f"Usado: {(mem.total - mem.available)/1024**3:.1f}GB"
+            )
+
+            # Disco
+            disk = psutil.disk_usage('/')
+            self.logger.debug(
+                f"Disco - Total: {disk.total/1024**3:.1f}GB, "
+                f"Usado: {disk.used/1024**3:.1f}GB, "
+                f"Libre: {disk.free/1024**3:.1f}GB"
+            )
+
+            # GPU si está disponible
+            if GPU_AVAILABLE:
+                try:
+                    gpus = GPUtil.getGPUs()
+                    for i, gpu in enumerate(gpus):
+                        self.logger.debug(
+                            f"GPU {i} - {gpu.name}: Memoria Total: {gpu.memoryTotal}MB, "
+                            f"Usada: {gpu.memoryUsed}MB, Temp: {getattr(gpu, 'temperature', 'N/A')}°C"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error al obtener información detallada de GPU: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Error al registrar detalles del sistema: {str(e)}")
 
     @performance_monitor
     def update_ui(self, cpu_percent: float, ram_percent: float, gpu_percent: float) -> None:
         """Actualización optimizada de la interfaz de usuario"""
         try:
-            # Actualizar CPU de manera segura
+            # Actualizar CPU
             try:
                 freq = psutil.cpu_freq()
                 freq_info = f"Frecuencia: {freq.current:.0f}MHz" if freq else ""
                 self.cpu_card.update(cpu_percent, info_text=freq_info)
+                log_debug(f"UI CPU actualizada: {cpu_percent:.1f}% {freq_info}")
             except Exception as e:
-                self.logger.error(f"Error al actualizar CPU: {str(e)}")
+                log_error(f"Error al actualizar UI CPU: {str(e)}")
                 self.cpu_card.update(cpu_percent)
 
-            # Actualizar RAM de manera segura
+            # Actualizar RAM
             try:
                 ram = psutil.virtual_memory()
                 total_gb = ram.total / (1024**3)
                 used_gb = (ram.total - ram.available) / (1024**3)
-                self.ram_card.update(
-                    ram_percent,
-                    info_text=f"Usado: {used_gb:.1f}GB de {total_gb:.1f}GB"
-                )
+                info_text = f"Usado: {used_gb:.1f}GB de {total_gb:.1f}GB"
+                self.ram_card.update(ram_percent, info_text=info_text)
+                log_debug(f"UI RAM actualizada: {ram_percent:.1f}% ({info_text})")
             except Exception as e:
-                self.logger.error(f"Error al actualizar RAM: {str(e)}")
+                log_error(f"Error al actualizar UI RAM: {str(e)}")
                 self.ram_card.update(ram_percent)
 
-            # Actualizar GPU de manera segura
+            # Actualizar GPU
             try:
-                gpus = GPUtil.getGPUs()
-                if gpus and len(gpus) > 0:
-                    gpu = gpus[0]
-                    gpu_info = [f"Memoria: {gpu.memoryUsed:.0f}MB/{gpu.memoryTotal:.0f}MB"]
-                    if hasattr(gpu, 'temperature'):
-                        gpu_info.append(f"Temp: {gpu.temperature}°C")
-                    self.gpu_card.update(gpu_percent, info_text=" | ".join(gpu_info))
+                if GPU_AVAILABLE:
+                    gpu_info = self._get_gpu_info()
+                    if gpu_info:
+                        info_text = (f"Memoria: {gpu_info['memory_used']:.0f}MB/"
+                                   f"{gpu_info['memory_total']:.0f}MB")
+                        if gpu_info['temperature']:
+                            info_text += f" | Temp: {gpu_info['temperature']}°C"
+                        self.gpu_card.update(gpu_percent, info_text=info_text)
+                        log_debug(f"UI GPU actualizada: {gpu_percent:.1f}% ({info_text})")
+                    else:
+                        self.gpu_card.update(0, info_text="GPU no disponible")
+                        log_debug("GPU no disponible")
                 else:
-                    self.gpu_card.update(0, info_text="GPU no disponible")
+                    self.gpu_card.update(0, info_text="GPUtil no instalado")
+                    log_debug("GPUtil no instalado")
             except Exception as e:
-                self.logger.error(f"Error al actualizar GPU: {str(e)}")
+                log_error(f"Error al actualizar UI GPU: {str(e)}")
                 self.gpu_card.update(0, info_text="Error al leer GPU")
 
             # Actualizar gráfico si está visible y hay cambios significativos
@@ -1412,11 +1567,11 @@ class MonitorApp(ctk.CTk):
                 ])):
                 self.update_graph()
 
-            # Verificar umbrales de manera segura
+            # Verificar umbrales
             self.check_thresholds(cpu_percent, ram_percent, gpu_percent)
 
         except Exception as e:
-            self.logger.error(f"Error en update_ui: {str(e)}", exc_info=True)
+            log_error("Error general en actualización de UI", exc_info=True)
 
     def check_thresholds(self, cpu: float, ram: float, gpu: float) -> None:
         """Verificación optimizada de umbrales"""
@@ -1425,13 +1580,12 @@ class MonitorApp(ctk.CTk):
             for resource, value in [('cpu', cpu), ('ram', ram), ('gpu', gpu)]:
                 if (value > self.thresholds[resource] and
                     current_time - self.notification_cooldown.get(resource, 0) > self.grace_period):
-                    self.show_notification(
-                        f"{resource.upper()} Alert",
-                        f"{resource.upper()} uso alto: {value:.1f}%"
-                    )
+                    message = f"{resource.upper()} uso alto: {value:.1f}%"
+                    self.show_notification(f"{resource.upper()} Alert", message)
+                    log_warning(f"Umbral excedido - {message}")
                     self.notification_cooldown[resource] = current_time
         except Exception as e:
-            self.logger.error(f"Error al verificar umbrales: {str(e)}", exc_info=True)
+            log_error(f"Error al verificar umbrales: {str(e)}", exc_info=True)
 
     def show_notification(self, title: str, message: str) -> None:
         """Muestra notificaciones de manera segura"""
@@ -1443,9 +1597,38 @@ class MonitorApp(ctk.CTk):
                     app_icon=None,
                     timeout=10,
                 )
-                self.logger.info(f"Notificación enviada: {title} - {message}")
+                log_debug(f"Notificación enviada: {title} - {message}")
         except Exception as e:
-            self.logger.error(f"Error al mostrar notificación: {str(e)}", exc_info=True)
+            log_error(f"Error al mostrar notificación: {str(e)}", exc_info=True)
+
+    def _get_cpu_frequency(self):
+        try:
+            freq = psutil.cpu_freq()
+            if freq:
+                return {
+                    'current': freq.current,
+                    'min': freq.min,
+                    'max': freq.max
+                }
+        except Exception as e:
+            log_error(f"Error al obtener frecuencia de CPU: {str(e)}")
+        return None
+
+    def _get_gpu_info(self):
+        try:
+            if GPU_AVAILABLE:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]
+                    return {
+                        'name': gpu.name,
+                        'memory_used': gpu.memoryUsed,
+                        'memory_total': gpu.memoryTotal,
+                        'temperature': getattr(gpu, 'temperature', None)
+                    }
+        except Exception as e:
+            log_error(f"Error al obtener información de GPU: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     app = MonitorApp()
